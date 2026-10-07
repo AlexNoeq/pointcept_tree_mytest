@@ -17,10 +17,14 @@ from .litept import *
 
 # Semantic Segmentation
 from .context_aware_classifier import *
+from .volt import *
+
 
 # Instance Segmentation
 from .point_group import *
 from .sgiformer import *
+from .segment_any_tree_v2 import *
+
 
 # Pretraining
 from .masked_scene_contrast import *

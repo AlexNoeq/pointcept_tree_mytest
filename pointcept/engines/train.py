@@ -11,6 +11,7 @@ import weakref
 import wandb
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import torch.utils.data
 from packaging import version
 from functools import partial
@@ -146,6 +147,10 @@ class Trainer(TrainerBase):
         self.train_loader = self.build_train_loader()
         self.logger.info("=> Building val dataset & dataloader ...")
         self.val_loader = self.build_val_loader()
+        self.test_loader = None
+        if getattr(self.cfg, "evaluate_test", False):
+            self.logger.info("=> Building test dataset & dataloader for training-time evaluation ...")
+            self.test_loader = self.build_test_loader()
         self.logger.info("=> Building optimize, scheduler, scaler(amp) ...")
         self.optimizer = self.build_optimizer()
         self.scheduler = self.build_scheduler()
@@ -153,6 +158,10 @@ class Trainer(TrainerBase):
         self.logger.info("=> Building hooks ...")
         self.register_hooks(self.cfg.hooks)
         self._gradient_accumulation_counter = 0
+        self._empty_sample_log_interval = max(
+            int(getattr(self.cfg.model, "sparse_log_interval", 100)), 1
+        )
+        self._pending_empty_samples = []
 
     def train(self):
         with EventStorage() as self.storage, ExceptionWriter():
@@ -190,6 +199,28 @@ class Trainer(TrainerBase):
             auto_cast = torch.cuda.amp.autocast
 
         input_dict = self.comm_info["input_dict"]
+        if input_dict is None:
+            input_dict = {"_skip_batch": True, "_skipped_samples": []}
+        local_skip_batch = bool(input_dict.get("_skip_batch", False))
+        self._pending_empty_samples.extend(input_dict.get("_skipped_samples", []))
+        if comm.get_world_size() > 1:
+            # Keep all DDP ranks on the same forward/backward schedule.
+            has_valid_sample = torch.tensor(
+                0 if local_skip_batch else 1,
+                dtype=torch.int32,
+                device="cuda",
+            )
+            dist.all_reduce(has_valid_sample, op=dist.ReduceOp.MIN)
+            global_batch_valid = bool(has_valid_sample.item())
+        else:
+            global_batch_valid = not local_skip_batch
+        if not global_batch_valid:
+            self.comm_info["model_output_dict"] = {}
+            self._report_skipped_samples()
+            return
+
+        input_dict.pop("_skip_batch", None)
+        input_dict.pop("_skipped_samples", None)
         for key in input_dict.keys():
             if isinstance(input_dict[key], torch.Tensor):
                 input_dict[key] = input_dict[key].cuda(non_blocking=True)
@@ -244,8 +275,34 @@ class Trainer(TrainerBase):
         if self.cfg.empty_cache:
             torch.cuda.empty_cache()
         self.comm_info["model_output_dict"] = output_dict
+        self._report_skipped_samples()
+
+    def _report_skipped_samples(self, force=False):
+        if (
+            not force
+            and (self.comm_info["iter"] + 1) % self._empty_sample_log_interval != 0
+        ):
+            return
+        gathered = comm.all_gather(self._pending_empty_samples)
+        skipped_samples = [
+            record for records in gathered for record in records
+        ]
+        if skipped_samples and comm.is_main_process():
+            summary = ", ".join(
+                f"{record.get('name') or '<unnamed>'}:"
+                f"{record.get('reason', 'empty_sample')}"
+                f"(points={record.get('points', 0)})"
+                for record in skipped_samples
+            )
+            self.logger.info(
+                "Skipped empty input samples in the last %d training batches: %s",
+                self._empty_sample_log_interval,
+                summary,
+            )
+        self._pending_empty_samples.clear()
 
     def after_epoch(self):
+        self._report_skipped_samples(force=True)
         for h in self.hooks:
             h.after_epoch()
         self.storage.reset_histories()
@@ -332,6 +389,35 @@ class Trainer(TrainerBase):
                 collate_fn=collate_fn,
             )
         return val_loader
+
+    def build_test_loader(self):
+        """Build an optional test loader used by evaluation hooks during training."""
+        test_data = build_dataset(self.cfg.data.test)
+        if comm.get_world_size() > 1:
+            test_sampler = torch.utils.data.distributed.DistributedSampler(test_data)
+        else:
+            test_sampler = None
+        init_fn = (
+            partial(
+                worker_init_fn,
+                num_workers=self.cfg.num_worker_per_gpu,
+                rank=comm.get_rank(),
+                seed=self.cfg.seed,
+            )
+            if self.cfg.seed is not None
+            else None
+        )
+        return torch.utils.data.DataLoader(
+            test_data,
+            batch_size=self.cfg.batch_size_test_per_gpu,
+            shuffle=False,
+            num_workers=self.cfg.num_worker_per_gpu,
+            pin_memory=True,
+            sampler=test_sampler,
+            collate_fn=collate_fn,
+            worker_init_fn=init_fn,
+            persistent_workers=self.cfg.num_worker_per_gpu > 0,
+        )
 
     def build_optimizer(self):
         return build_optimizer(self.cfg.optimizer, self.model, self.cfg.param_dicts)

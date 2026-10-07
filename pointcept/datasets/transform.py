@@ -861,6 +861,16 @@ class GridSample(object):
 
     def __call__(self, data_dict):
         assert "coord" in data_dict.keys()
+        if len(data_dict["coord"]) == 0:
+            return {
+                "_skip_sample": True,
+                "_skip_reason": "empty_input_before_grid_sample",
+                "_skip_name": data_dict.get("name"),
+                "_skip_point_count": 0,
+            }
+        data_dict["raw_point_count"] = np.asarray(
+            [len(data_dict["coord"])], dtype=np.int32
+        )
         scaled_coord = data_dict["coord"] / np.array(self.grid_size)
         grid_coord = np.floor(scaled_coord).astype(int)
         min_coord = grid_coord.min(0)
@@ -1365,6 +1375,8 @@ class Compose(object):
     def __call__(self, data_dict):
         for t in self.transforms:
             data_dict = t(data_dict)
+            if isinstance(data_dict, Mapping) and data_dict.get("_skip_sample", False):
+                break
         return data_dict
 
 

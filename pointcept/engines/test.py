@@ -1584,3 +1584,8 @@ class InsSegTester(TesterBase):
     def collate_fn(batch):
         # Restrict to bs 1
         return batch[0]
+
+
+# Imported last because the specialized tester reuses TESTERS and TesterBase
+# from this module.
+from .test_satv2 import SaTV2Tester  # noqa: E402,F401

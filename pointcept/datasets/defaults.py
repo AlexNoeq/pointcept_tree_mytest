@@ -160,6 +160,8 @@ class DefaultDataset(Dataset):
         # load data
         data_dict = self.get_data(idx)
         data_dict = self.transform(data_dict)
+        if data_dict.get("_skip_sample", False):
+            return data_dict
         result_dict = dict(segment=data_dict.pop("segment"), name=data_dict.pop("name"))
         if "origin_segment" in data_dict:
             assert "inverse" in data_dict

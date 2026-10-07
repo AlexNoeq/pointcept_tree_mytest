@@ -9,6 +9,9 @@ from .utils import point_collate_fn, collate_fn
 
 # indoor scene
 from .s3dis import S3DISDataset
+from .whu_stree import WHUStreeDataset
+from .for_instance import FORInstanceDataset
+from . import treeins_transforms
 from .scannet import (
     ScanNetDataset,
     ScanNet200Dataset,

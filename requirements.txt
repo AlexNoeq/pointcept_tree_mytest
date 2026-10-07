@@ -1,0 +1,38 @@
+# ninja
+# h5py
+# pyyaml
+# tensorboard
+# tensorboardx
+# wandb
+# yapf
+# addict
+# einops
+# scipy
+# plyfile
+# termcolor
+# timm
+# ftfy
+# regex
+# tqdm
+# matplotlib
+# black
+# open3d
+# peft
+
+# # 安装 PyG
+# torch-cluster
+# torch-scatter
+# torch-sparse
+# torch_geometric
+
+# # 其他包
+# spconv-cu118
+# git+https://github.com/octree-nn/ocnn-pytorch.git
+# git+https://github.com/openai/CLIP.git
+# git+https://github.com/Dao-AILab/flash-attention.git
+./libs/pointops
+./libs/pointgroup_ops
+./libs/pointops2
+./libs/pointrope
+./libs/pointseg
+# ./libs/flash-attention

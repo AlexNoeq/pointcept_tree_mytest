@@ -16,6 +16,18 @@ from torch_scatter import scatter_min
 from pointcept.models.utils import offset2batch
 
 
+def _skipped_sample_record(sample):
+    if sample is None:
+        return {"name": None, "reason": "dataset_returned_none", "points": 0}
+    if isinstance(sample, Mapping) and sample.get("_skip_sample", False):
+        return {
+            "name": sample.get("_skip_name"),
+            "reason": sample.get("_skip_reason", "empty_sample"),
+            "points": sample.get("_skip_point_count", 0),
+        }
+    return None
+
+
 def collate_fn(batch):
     """
     collate function for point cloud which support dict and list,
@@ -23,6 +35,20 @@ def collate_fn(batch):
     """
     if not isinstance(batch, Sequence):
         raise TypeError(f"{batch.dtype} is not supported.")
+
+    skipped_samples = [
+        record
+        for sample in batch
+        if (record := _skipped_sample_record(sample)) is not None
+    ]
+    if skipped_samples:
+        batch = [
+            sample
+            for sample in batch
+            if _skipped_sample_record(sample) is None
+        ]
+        if not batch:
+            return {"_skip_batch": True, "_skipped_samples": skipped_samples}
 
     if isinstance(batch[0], torch.Tensor):
         return torch.cat(list(batch))
@@ -68,6 +94,8 @@ def collate_fn(batch):
             )
             for key in batch[0]
         }
+        if skipped_samples:
+            batch["_skipped_samples"] = skipped_samples
         return batch
     else:
         return default_collate(batch)
@@ -206,10 +234,14 @@ def regroup_batch(batch, N, original_offsets, data_keys):
 
 
 def point_collate_fn(batch, mix_prob=0):
-    assert isinstance(
-        batch[0], Mapping
-    )  # currently, only support input_dict, rather than input_list
+    if not batch:
+        return {"_skip_batch": True, "_skipped_samples": []}
     batch = collate_fn(batch)
+    if batch.get("_skip_batch", False):
+        return batch
+    assert isinstance(
+        batch, Mapping
+    )  # currently, only support input_dict, rather than input_list
     if random.random() < mix_prob:
         valid_keys = [
             "coord",

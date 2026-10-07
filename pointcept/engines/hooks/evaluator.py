@@ -330,9 +330,15 @@ class SemSegEvaluator(HookBase):
 
 @HOOKS.register_module()
 class InsSegEvaluator(HookBase):
-    def __init__(self, segment_ignore_index=(-1,), instance_ignore_index=-1):
+    def __init__(
+        self,
+        segment_ignore_index=(-1,),
+        instance_ignore_index=-1,
+        evaluate_test=False,
+    ):
         self.segment_ignore_index = segment_ignore_index
         self.instance_ignore_index = instance_ignore_index
+        self.evaluate_test = evaluate_test
 
         self.valid_class_names = None  # update in before train
         self.overlaps = np.append(np.arange(0.5, 0.95, 0.05), 0.25)
@@ -349,7 +355,15 @@ class InsSegEvaluator(HookBase):
 
     def after_epoch(self):
         if self.trainer.cfg.evaluate:
-            self.eval()
+            self.eval(self.trainer.val_loader, split="val", update_checkpoint=True)
+            if self.evaluate_test:
+                test_loader = getattr(self.trainer, "test_loader", None)
+                if test_loader is None:
+                    raise RuntimeError(
+                        "InsSegEvaluator(evaluate_test=True) requires cfg.evaluate_test=True "
+                        "and a data.test split."
+                    )
+                self.eval(test_loader, split="test", update_checkpoint=False)
 
     def associate_instances(self, pred, segment, instance):
         segment = segment.cpu().numpy()
@@ -630,11 +644,17 @@ class InsSegEvaluator(HookBase):
             )
         return ap_scores
 
-    def eval(self):
-        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+    def eval(self, loader=None, split="val", update_checkpoint=True):
+        if loader is None:
+            loader = self.trainer.val_loader
+        self.trainer.logger.info(
+            ">>>>>>>>>>>>>>>> Start {} Instance Evaluation >>>>>>>>>>>>>>>>".format(
+                split.capitalize()
+            )
+        )
         self.trainer.model.eval()
         scenes = {}
-        for i, input_dict in enumerate(self.trainer.val_loader):
+        for i, input_dict in enumerate(loader):
             assert (
                 len(input_dict["offset"]) == 1
             )  # currently only support bs 1 for each GPU
@@ -668,15 +688,18 @@ class InsSegEvaluator(HookBase):
             )
             scenes[data_name] = dict(gt=gt_instances, pred=pred_instance)
 
-            self.trainer.storage.put_scalar("val_loss", loss.item())
+            self.trainer.storage.put_scalar(f"{split}_loss", loss.item())
             self.trainer.logger.info(
-                "Test: [{iter}/{max_iter}] "
+                "{split}: [{iter}/{max_iter}] "
                 "Loss {loss:.4f} ".format(
-                    iter=i + 1, max_iter=len(self.trainer.val_loader), loss=loss.item()
+                    split=split.capitalize(),
+                    iter=i + 1,
+                    max_iter=len(loader),
+                    loss=loss.item(),
                 )
             )
 
-        loss_avg = self.trainer.storage.history("val_loss").avg
+        loss_avg = self.trainer.storage.history(f"{split}_loss").avg
         comm.synchronize()
         scenes_sync = comm.gather(scenes, dst=0)
 
@@ -692,8 +715,8 @@ class InsSegEvaluator(HookBase):
             all_ap_50 = ap_scores["all_ap_50%"]
             all_ap_25 = ap_scores["all_ap_25%"]
             self.trainer.logger.info(
-                "Val result: mAP/AP50/AP25 {:.4f}/{:.4f}/{:.4f}.".format(
-                    all_ap, all_ap_50, all_ap_25
+                "{} result: mAP/AP50/AP25 {:.4f}/{:.4f}/{:.4f}.".format(
+                    split.capitalize(), all_ap, all_ap_50, all_ap_25
                 )
             )
             for i, label_name in enumerate(self.valid_class_names):
@@ -701,32 +724,40 @@ class InsSegEvaluator(HookBase):
                 ap_50 = ap_scores["classes"][label_name]["ap50%"]
                 ap_25 = ap_scores["classes"][label_name]["ap25%"]
                 self.trainer.logger.info(
-                    "Class_{idx}-{name} Result: AP/AP50/AP25 {AP:.4f}/{AP50:.4f}/{AP25:.4f}".format(
-                        idx=i, name=label_name, AP=ap, AP50=ap_50, AP25=ap_25
+                    "{} Class_{idx}-{name} Result: AP/AP50/AP25 {AP:.4f}/{AP50:.4f}/{AP25:.4f}".format(
+                        split.capitalize(),
+                        idx=i,
+                        name=label_name,
+                        AP=ap,
+                        AP50=ap_50,
+                        AP25=ap_25,
                     )
                 )
             current_epoch = self.trainer.epoch + 1
             if self.trainer.writer is not None:
-                self.trainer.writer.add_scalar("val/loss", loss_avg, current_epoch)
-                self.trainer.writer.add_scalar("val/mAP", all_ap, current_epoch)
-                self.trainer.writer.add_scalar("val/AP50", all_ap_50, current_epoch)
-                self.trainer.writer.add_scalar("val/AP25", all_ap_25, current_epoch)
+                self.trainer.writer.add_scalar(f"{split}/loss", loss_avg, current_epoch)
+                self.trainer.writer.add_scalar(f"{split}/mAP", all_ap, current_epoch)
+                self.trainer.writer.add_scalar(f"{split}/AP50", all_ap_50, current_epoch)
+                self.trainer.writer.add_scalar(f"{split}/AP25", all_ap_25, current_epoch)
                 if self.trainer.cfg.enable_wandb:
                     wandb.log(
                         {
                             "Epoch": current_epoch,
-                            "val/loss": loss_avg,
-                            "val/mAP": all_ap,
-                            "val/AP50": all_ap_50,
-                            "val/AP25": all_ap_25,
+                            f"{split}/loss": loss_avg,
+                            f"{split}/mAP": all_ap,
+                            f"{split}/AP50": all_ap_50,
+                            f"{split}/AP25": all_ap_25,
                         },
                         step=wandb.run.step,
                     )
             self.trainer.logger.info(
-                "<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<"
+                "<<<<<<<<<<<<<<<<< End {} Instance Evaluation <<<<<<<<<<<<<<<<<".format(
+                    split.capitalize()
+                )
             )
-            self.trainer.comm_info["current_metric_value"] = all_ap_50  # save for saver
-            self.trainer.comm_info["current_metric_name"] = "AP50"  # save for saver
+            if update_checkpoint:
+                self.trainer.comm_info["current_metric_value"] = all_ap_50
+                self.trainer.comm_info["current_metric_name"] = "AP50"
 
 
 @HOOKS.register_module()
